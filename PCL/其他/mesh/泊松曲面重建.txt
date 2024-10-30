@@ -1,0 +1,86 @@
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/surface/poisson.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <iostream>
+
+int main(int argc, char** argv)
+{
+    // 创建 PointCloud<pcl::PointXYZRGB> 智能指针
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PCLPointCloud2::Ptr cloud_blob(new pcl::PCLPointCloud2);
+
+    // 加载点云数据
+    if (pcl::io::loadPCDFile("../1.pcd", *cloud_blob) == -1)
+    {
+        PCL_ERROR("Couldn't read file \n");
+        return -1;
+    }
+    pcl::fromPCLPointCloud2(*cloud_blob, *cloud);
+    std::cout << "Original Cloud Size: " << cloud->points.size() << std::endl;
+
+    // 创建法线估计对象
+    pcl::NormalEstimation<pcl::PointXYZRGB, pcl::Normal> n;
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+    pcl::search::KdTree<pcl::PointXYZRGB>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZRGB>);
+    tree->setInputCloud(cloud);
+    n.setInputCloud(cloud);
+    n.setSearchMethod(tree);
+    n.setKSearch(20);
+    n.compute(*normals);
+    std::cout << "Normals Computed" << std::endl;
+
+    // 将点云与法线字段拼接
+    pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr cloud_with_normals(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+    pcl::concatenateFields(*cloud, *normals, *cloud_with_normals);
+    std::cout << "Cloud with Normals Size: " << cloud_with_normals->points.size() << std::endl;
+
+    // 创建搜索树
+    pcl::search::KdTree<pcl::PointXYZRGBNormal>::Ptr tree2(new pcl::search::KdTree<pcl::PointXYZRGBNormal>);
+    tree2->setInputCloud(cloud_with_normals);
+
+    // 创建 Poisson 对象，并设置参数
+    pcl::Poisson<pcl::PointXYZRGBNormal> pn;
+    pn.setConfidence(true); // 是否使用法向量的大小作为置信信息。设置为 false 时，所有法向量均归一化。
+    pn.setDegree(2); // 设置参数 degree [1,5]，值越大越精细，耗时越久。
+    pn.setDepth(8); // 树的最大深度，求解 2^d x 2^d x 2^d 立方体元。由于八叉树自适应采样密度，指定值仅为最大深度。
+    pn.setIsoDivide(8); // 用于提取 ISO 等值面的算法的深度
+    pn.setManifold(true); // 是否添加多边形的重心，当多边形三角化时。设置为 true，则对多边形进行细分三角化时添加重心；设置为 false，则不添加。
+    pn.setOutputPolygons(true); // 是否输出多边形网格（而不是三角化移动立方体的结果）
+    pn.setSamplesPerNode(1.0f); // 设置落入一个八叉树节点中的样本点的最小数量。无噪声：[1.0-5.0]，有噪声：[15.0-20.0]，用于平滑。
+    pn.setScale(1.0f); // 设置用于重构的立方体直径和样本边界立方体直径的比率。
+    pn.setSolverDivide(8); // 设置求解线性方程组的 Gauss-Seidel 迭代方法的深度。
+
+    // 设置搜索方法和输入点云
+    pn.setSearchMethod(tree2);
+    pn.setInputCloud(cloud_with_normals);
+
+    // 创建多边形网格，用于存储结果
+    pcl::PolygonMesh mesh;
+
+    // 执行重建
+    pn.performReconstruction(mesh);
+    std::cout << "Mesh Reconstructed" << std::endl;
+
+    // 创建可视化对象
+    pcl::visualization::PCLVisualizer viewer("PCL Viewer");
+
+    // 设置可视化窗口背景颜色
+    viewer.setBackgroundColor(1.0, 1.0, 1.0); // 设置背景颜色为白色
+
+    // 添加多边形网格到可视化对象
+    viewer.addPolygonMesh(mesh, "mesh");
+
+    // 设置相机位置
+    viewer.setCameraPosition(0, 0, 10, 0, -1, 0);
+
+    // 启动可视化循环
+    while (!viewer.wasStopped())
+    {
+        viewer.spinOnce(100); // 让视图有更多时间进行更新
+    }
+
+    return 0;
+}

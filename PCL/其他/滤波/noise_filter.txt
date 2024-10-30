@@ -1,0 +1,119 @@
+#include <pcl/point_types.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/io/ply_io.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/sample_consensus/method_types.h>
+#include <pcl/sample_consensus/model_types.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <Eigen/Dense>
+
+// 滤波函数，基于相邻点的平面拟合
+void filterPointCloud(const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& input_cloud,
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr& output_cloud,
+    int K = 50, float max_relative_error = 1.0f)
+{
+    pcl::KdTreeFLANN<pcl::PointXYZRGB> kdtree;
+    kdtree.setInputCloud(input_cloud);
+
+    for (size_t i = 0; i < input_cloud->points.size(); ++i)
+    {
+        std::vector<int> pointIdxNKNSearch(K);
+        std::vector<float> pointNKNSquaredDistance(K);
+
+        if (kdtree.nearestKSearch(input_cloud->points[i], K, pointIdxNKNSearch, pointNKNSquaredDistance) > 0)
+        {
+            // 使用邻近点拟合平面
+            Eigen::MatrixXf points(3, K);
+            for (int j = 0; j < K; ++j)
+            {
+                points(0, j) = input_cloud->points[pointIdxNKNSearch[j]].x;
+                points(1, j) = input_cloud->points[pointIdxNKNSearch[j]].y;
+                points(2, j) = input_cloud->points[pointIdxNKNSearch[j]].z;
+            }
+
+            // 计算质心
+            Eigen::Vector3f centroid = points.rowwise().mean();
+            points.colwise() -= centroid;
+
+            // 计算协方差矩阵并进行SVD分解
+            Eigen::JacobiSVD<Eigen::MatrixXf> svd(points * points.transpose(), Eigen::ComputeFullU);
+            Eigen::Vector3f plane_normal = svd.matrixU().col(2);
+
+            // 计算点到平面的距离
+            float distance = std::abs(plane_normal.dot(Eigen::Vector3f(input_cloud->points[i].x,
+                input_cloud->points[i].y,
+                input_cloud->points[i].z) - centroid));
+
+            float mean_distance = 0.0f;
+            for (int j = 0; j < K; ++j)
+            {
+                mean_distance += std::abs(plane_normal.dot(Eigen::Vector3f(points(0, j), points(1, j), points(2, j))));
+            }
+            mean_distance /= K;
+
+            // 如果距离小于或等于相对误差阈值，则保留该点
+            if (distance <= max_relative_error * mean_distance)
+            {
+                output_cloud->points.push_back(input_cloud->points[i]);
+            }
+        }
+    }
+
+    // 更新点云信息
+    output_cloud->width = output_cloud->points.size();
+    output_cloud->height = 1;
+    output_cloud->is_dense = true;
+}
+
+int main(int argc, char** argv)
+{
+    // 创建点云对象
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    // 加载点云数据
+    if (pcl::io::loadPLYFile<pcl::PointXYZRGB>("../cloud4_1.ply", *cloud_in) == -1)
+    {
+        PCL_ERROR("Couldn't read file cloud4_1.ply\n");
+        return -1;
+    }
+
+    // 输出点云数量
+    std::cout << "Number of points in the input cloud: " << cloud_in->size() << std::endl;
+
+    // 运行滤波操作多次
+    int filter_runs =3; // 设定滤波运行次数
+    int KNN = 50;
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    for (int i = 0; i < filter_runs; ++i)
+    {
+        temp_cloud->clear();
+        KNN = KNN - 10;
+        filterPointCloud(cloud_in, temp_cloud, KNN, 1.5f);
+        cloud_in.swap(temp_cloud); // 使用新的滤波结果作为输入
+        std::cout << "Filter run " << i + 1 << ": " << cloud_in->size() << " points remaining." << std::endl;
+    }
+
+    // 保存最终滤波后的点云
+    pcl::io::savePLYFileBinary("../filtered_cloud.ply", *cloud_in);
+    std::cout << "Filtered cloud saved as filtered_cloud.ply with " << cloud_in->size() << " points." << std::endl;
+
+    // 创建可视化窗口
+    pcl::visualization::PCLVisualizer viewer("Cloud Viewer");
+    viewer.setBackgroundColor(0.0, 0.0, 0.0);
+
+    // 添加点云到可视化窗口
+    viewer.addPointCloud<pcl::PointXYZRGB>(cloud_in, "filtered cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "filtered cloud");
+    viewer.resetCamera();
+
+    // 开始可视化
+    while (!viewer.wasStopped())
+    {
+        viewer.spinOnce();
+    }
+
+    return 0;
+}

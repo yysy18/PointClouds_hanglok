@@ -1,0 +1,76 @@
+#include <pcl/point_types.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/surface/gp3.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <boost/thread/thread.hpp>
+
+int main(int argc, char** argv)
+{
+    // 创建 PointCloud<pcl::PointXYZRGB> 智能指针
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PCLPointCloud2::Ptr cloud_blob(new pcl::PCLPointCloud2);
+
+    // 加载点云数据
+    if (pcl::io::loadPCDFile("../1.pcd", *cloud_blob) == -1)
+    {
+        PCL_ERROR("Couldn't read file \n");
+        return -1;
+    }
+    pcl::fromPCLPointCloud2(*cloud_blob, *cloud);
+    std::cout << "Original Cloud Size: " << cloud->points.size() << std::endl;
+
+    // 创建法线估计对象
+    pcl::NormalEstimation<pcl::PointXYZRGB, pcl::Normal> n;
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+    pcl::search::KdTree<pcl::PointXYZRGB>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZRGB>);
+    tree->setInputCloud(cloud);
+    n.setInputCloud(cloud);
+    n.setSearchMethod(tree);
+    n.setKSearch(20);
+    n.compute(*normals);
+    std::cout << "Normals Computed" << std::endl;
+
+    // 将点云与法线字段拼接
+    pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr cloud_with_normals(new pcl::PointCloud<pcl::PointXYZRGBNormal>);
+    pcl::concatenateFields(*cloud, *normals, *cloud_with_normals);
+    std::cout << "Cloud with Normals Size: " << cloud_with_normals->points.size() << std::endl;
+
+    // 创建搜索树
+    pcl::search::KdTree<pcl::PointXYZRGBNormal>::Ptr tree2(new pcl::search::KdTree<pcl::PointXYZRGBNormal>);
+    tree2->setInputCloud(cloud_with_normals);
+
+    // 初始化贪婪三角化的对象
+    pcl::GreedyProjectionTriangulation<pcl::PointXYZRGBNormal> gp3;
+    pcl::PolygonMesh triangles;
+
+    // 设置贪婪三角化参数
+    gp3.setSearchRadius(0.1); // 适度降低搜索半径，以减少计算负担5
+    gp3.setMu(2.5);
+    gp3.setMaximumNearestNeighbors(100); // 减少最大近邻点数
+    gp3.setMaximumSurfaceAngle(M_PI / 4);
+    gp3.setMinimumAngle(M_PI / 18);
+    gp3.setMaximumAngle(2 * M_PI / 3);
+    gp3.setNormalConsistency(false);
+
+    std::cout << "Starting GreedyProjectionTriangulation" << std::endl;
+    gp3.setInputCloud(cloud_with_normals);
+    gp3.setSearchMethod(tree2);
+    gp3.reconstruct(triangles);
+    std::cout << "Mesh Reconstructed" << std::endl;
+
+    // 可视化
+    boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
+    viewer->setBackgroundColor(1, 1,1);
+    viewer->addPolygonMesh(triangles, "mesh");
+    viewer->addCoordinateSystem(1.0);
+    viewer->initCameraParameters();
+
+    while (!viewer->wasStopped())
+    {
+        viewer->spinOnce(100);
+        boost::this_thread::sleep(boost::posix_time::microseconds(100000));
+    }
+    return 0;
+}

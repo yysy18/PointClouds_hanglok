@@ -1,0 +1,86 @@
+#include <pcl/io/ply_io.h>
+#include <pcl/filters/convolution_3d.h>
+#include <pcl/filters/convolution.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <boost/shared_ptr.hpp>  // 包含 boost::shared_ptr
+#include <iostream>
+
+// 使用 boost::shared_ptr
+bool GaussianSmooth(const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud, pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloudout, const double& sigma, const double& radius)
+{
+    if (cloud == nullptr || cloud->points.empty()) return false;
+
+    // 创建高斯核
+    boost::shared_ptr<pcl::filters::GaussianKernel<pcl::PointXYZRGB, pcl::PointXYZRGB>> kernel(new pcl::filters::GaussianKernel<pcl::PointXYZRGB, pcl::PointXYZRGB>);
+    kernel->setSigma(sigma);
+    kernel->setThresholdRelativeToSigma(4);
+
+    // 设置搜索方法
+    boost::shared_ptr<pcl::search::KdTree<pcl::PointXYZRGB>> kdtree(new pcl::search::KdTree<pcl::PointXYZRGB>);
+    kdtree->setInputCloud(cloud);
+
+    // 创建3D卷积滤波器
+    pcl::filters::Convolution3D<pcl::PointXYZRGB, pcl::PointXYZRGB, pcl::filters::GaussianKernel<pcl::PointXYZRGB, pcl::PointXYZRGB>> convolution;
+    convolution.setKernel(*kernel);
+    convolution.setInputCloud(cloud);
+    convolution.setSearchMethod(kdtree);  // 使用 boost::shared_ptr
+    convolution.setRadiusSearch(radius);
+    convolution.setNumberOfThreads(4);  // Set Thread number for OpenMP
+    convolution.convolve(*cloudout);
+
+    return true;
+}
+
+int main(int argc, char** argv)
+{
+    // 创建点云对象
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    // 加载点云数据
+    if (pcl::io::loadPLYFile<pcl::PointXYZRGB>("../cloud4_1.ply", *cloud_in) == -1)
+    {
+        PCL_ERROR("Couldn't read file cloud4_1.ply\n");
+        return -1;
+    }
+
+    // 输出点云数量
+    std::cout << "Number of points in the input cloud: " << cloud_in->size() << std::endl;
+    if (cloud_in->empty())
+    {
+        PCL_ERROR("Input point cloud is empty!\n");
+        return -1;
+    }
+
+    // 执行高斯滤波
+    if (!GaussianSmooth(cloud_in, cloud_filtered, 4.0, 0.01))
+    {
+        PCL_ERROR("Gaussian smoothing failed!\n");
+        return -1;
+    }
+
+    // 输出滤波后点云数量
+    std::cout << "Number of points in the filtered cloud: " << cloud_filtered->size() << std::endl;
+    if (cloud_filtered->empty())
+    {
+        PCL_ERROR("Filtered point cloud is empty!\n");
+        return -1;
+    }
+
+    // 保存滤波后的点云
+    pcl::io::savePLYFile("../filtered_cloud.ply", *cloud_filtered);
+
+    // 创建可视化窗口
+    pcl::visualization::PCLVisualizer viewer("Cloud Viewer");
+    viewer.setBackgroundColor(0.0, 0.0, 0.0);
+
+    // 添加点云到可视化窗口
+    viewer.addPointCloud<pcl::PointXYZRGB>(cloud_filtered, "filtered cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "filtered cloud");
+    viewer.resetCamera();
+
+    // 开始可视化
+    viewer.spin();
+
+    return 0;
+}

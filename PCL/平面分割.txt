@@ -1,0 +1,126 @@
+#include <pcl/point_cloud.h>  
+#include <pcl/point_types.h>
+#include <pcl/io/ply_io.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/segmentation/region_growing_rgb.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <algorithm> // 用于 std::sort
+
+int main() {
+    // 加载点云文件
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZRGB>);
+    if (pcl::io::loadPLYFile("C:\\Users\\HP\\Desktop\\1\\1025\\1\\R_back.ply", *cloud_in) == -1) {
+        PCL_ERROR("无法加载文件\n");
+        return -1;
+    }
+    // 平面分割初始化
+    pcl::SACSegmentation<pcl::PointXYZRGB> seg(true);
+    seg.setOptimizeCoefficients(true);
+    seg.setModelType(pcl::SACMODEL_PLANE);
+    seg.setMethodType(pcl::SAC_RANSAC);
+    seg.setMaxIterations(1000);
+    seg.setDistanceThreshold(0.06);
+
+    // 定义变量用于存储平面信息
+    pcl::ExtractIndices<pcl::PointXYZRGB> extract;
+    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+    std::vector<pcl::ModelCoefficients> coeffs;
+    std::vector<pcl::PointCloud<pcl::PointXYZRGB>::Ptr> planes;
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_copy(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    *cloud_copy = *cloud_in;
+    int plane_count = 0;
+
+    int nr_points = (int)cloud_copy->size();
+    // 提取较大平面
+    while (cloud_copy->points.size() > 0.3 * nr_points) {
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_temp(new pcl::PointCloud<pcl::PointXYZRGB>);
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_remaining(new pcl::PointCloud<pcl::PointXYZRGB>);
+        pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
+
+        seg.setInputCloud(cloud_copy);
+        seg.segment(*inliers, *coeff);
+
+        if (inliers->indices.empty()) {
+            break;
+        }
+
+        // 提取当前平面上的点
+        extract.setInputCloud(cloud_copy);
+        extract.setIndices(inliers);
+        extract.setNegative(false);
+        extract.filter(*cloud_temp);
+
+        // 提取剩余点
+        extract.setNegative(true);
+        extract.filter(*cloud_remaining);
+
+        planes.push_back(cloud_temp); // 保存当前平面点云
+        coeffs.push_back(*coeff);     // 保存当前平面系数
+        cloud_copy = cloud_remaining; // 更新剩余点云
+        plane_count++;
+    }
+
+    // 创建可视化窗口
+    pcl::visualization::PCLVisualizer::Ptr viewer(new pcl::visualization::PCLVisualizer("viewer"));
+    viewer->setBackgroundColor(1, 1, 1);
+    viewer->addPointCloud(cloud_in, "cloud_in");
+
+    // 使用 RegionGrowingRGB 进行颜色细分
+    std::vector<pcl::PointCloud<pcl::PointXYZRGB>::Ptr> color_clusters;
+    std::vector<size_t> cluster_sizes; // 存储每个聚类的点数
+
+    for (size_t i = 0; i < planes.size(); i++) {
+        pcl::RegionGrowingRGB<pcl::PointXYZRGB> reg;
+        pcl::PointIndices::Ptr cluster_indices(new pcl::PointIndices);
+
+        // 设置颜色聚类参数
+        reg.setInputCloud(planes[i]);
+        reg.setDistanceThreshold(1);           // 空间距离阈值
+        reg.setPointColorThreshold(5);          // 点颜色差异阈值
+        reg.setRegionColorThreshold(5);         // 区域颜色差异阈值
+        reg.setMinClusterSize(0.06 * nr_points); // 最小聚类大小
+
+        // 进行颜色聚类分割
+        std::vector<pcl::PointIndices> clusters;
+        reg.extract(clusters);
+
+        // 提取每个颜色聚类的点云
+        for (const auto& indices : clusters) {
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr color_cluster(new pcl::PointCloud<pcl::PointXYZRGB>);
+            pcl::ExtractIndices<pcl::PointXYZRGB> color_extract;
+            color_extract.setInputCloud(planes[i]);
+            color_extract.setIndices(boost::make_shared<pcl::PointIndices>(indices));
+            color_extract.setNegative(false);
+            color_extract.filter(*color_cluster);
+            color_clusters.push_back(color_cluster); // 存储细分后的结果
+            cluster_sizes.push_back(color_cluster->size()); // 记录聚类点数
+        }
+    }
+
+    // 按照点数对聚类进行排序
+    std::vector<size_t> indices(cluster_sizes.size());
+    std::iota(indices.begin(), indices.end(), 0); // 填充 0, 1, 2, ...
+
+    std::sort(indices.begin(), indices.end(), [&cluster_sizes](size_t a, size_t b) {
+        return cluster_sizes[a] > cluster_sizes[b]; // 从大到小排序
+        });
+
+    // 将前三个最大的平面显示为红、绿、蓝
+    for (size_t i = 0; i < std::min<size_t>(3, indices.size()); i++) {
+        size_t idx = indices[i];
+        pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZRGB> color_handler(color_clusters[idx],
+            (i == 0) ? 255 : (i == 1) ? 0 : 0, // 红色
+            (i == 0) ? 0 : (i == 1) ? 255 : 0, // 绿色
+            (i == 0) ? 0 : (i == 1) ? 0 : 255); // 蓝色
+        std::string cluster_name = "color_cluster" + std::to_string(idx + 1);
+        viewer->addPointCloud(color_clusters[idx], color_handler, cluster_name);
+    }
+
+    // 开始可视化
+    while (!viewer->wasStopped()) {
+        viewer->spinOnce(10);
+    }
+    return 0;
+}
