@@ -1,0 +1,534 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <pcl/point_types.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/segmentation/region_growing_rgb.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/io/ply_io.h>  // PLY 文件的头文件
+#include <thread>
+#include <chrono>
+#include <boost/thread/thread.hpp>
+#include <pcl/visualization/cloud_viewer.h>
+#include <pcl/visualization/mouse_event.h> //鼠标事件
+#include <pcl/visualization/keyboard_event.h>//键盘事件
+#include <pcl/filters/project_inliers.h>
+#include <pcl/ModelCoefficients.h>
+#include "vtkCamera.h"
+#include <vtkRenderWindow.h>
+#include <pcl/point_cloud.h>                          // 点云类定义头文件
+#include <pcl/kdtree/kdtree_flann.h>                  // 用于对点云进行Kd树搜索
+#include <pcl/surface/mls.h>                          // 点云平滑类头文件
+#include <pcl/surface/gp3.h>                          // 对点云进行三角化处理
+#include <pcl/surface/vtk_smoothing/vtk_utils.h>      // 用于PCL和VTK数据的相互转换
+#include <pcl/surface/vtk_smoothing/vtk_mesh_smoothing_laplacian.h> // 拉普拉斯平滑
+#include <vtkSmoothPolyDataFilter.h>
+
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZRGB>);
+pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_polygon(new pcl::PointCloud<pcl::PointXYZ>);
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_cliped(new pcl::PointCloud<pcl::PointXYZRGB>);
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr selected_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+pcl::PointXYZ curP, lastP;
+bool flag = false;//判断是不是第一次点击
+bool isPickingMode = false;
+unsigned int line_id = 0;
+
+
+//////////////////////////////////颜色区域增长分割阶段////////////////////////////////////////////////////////////////////////////
+// 显示点云和簇的函数
+void showCloudWithClusters(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud, std::vector<pcl::PointIndices> clusters)
+{
+    pcl::visualization::PCLVisualizer::Ptr viewer(new pcl::visualization::PCLVisualizer("Cluster Viewer"));
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    int color_id = 0;
+    for (const auto& cluster : clusters)
+    {
+        uint8_t r = ((color_id + 1) * 30) % 256;
+        uint8_t g = ((color_id + 1) * 60) % 256;
+        uint8_t b = ((color_id + 1) * 90) % 256;
+
+        color_id++;
+
+        pcl::PointXYZRGB centroid;
+        int point_count = 0;
+        for (const auto& index : cluster.indices)
+        {
+            pcl::PointXYZRGB p = cloud->points[index];
+            p.r = r;
+            p.g = g;
+            p.b = b;
+            colored_cloud->points.push_back(p);
+
+            centroid.x += p.x;
+            centroid.y += p.y;
+            centroid.z += p.z;
+            point_count++;
+        }
+
+        centroid.x /= point_count;
+        centroid.y /= point_count;
+        centroid.z /= point_count;
+
+        std::stringstream ss;
+        ss << color_id;
+        viewer->addText3D(ss.str(), centroid, 0.1, 1.0, 1.0, 0.0, "cluster_" + std::to_string(color_id));
+    }
+    colored_cloud->width = colored_cloud->points.size();
+    colored_cloud->height = 1;
+
+    viewer->addPointCloud(colored_cloud, "colored_cloud");
+    viewer->setBackgroundColor(0.0, 0.0, 0.0);
+    viewer->removeCoordinateSystem();
+
+    viewer->spin();
+}
+
+// 获取用户选择的簇索引
+std::vector<int> getUserSelectedClusters(int num_clusters)
+{
+    std::cout << "Select clusters by entering their indices (e.g., 2,4,5), followed by Enter: ";
+    std::vector<int> selected_clusters;
+    std::string input;
+    std::getline(std::cin, input);
+    std::istringstream iss(input);
+    std::string token;
+    while (std::getline(iss, token, ','))
+    {
+        int cluster_index = std::stoi(token);
+        if (cluster_index >= 1 && cluster_index <= num_clusters)
+        {
+            selected_clusters.push_back(cluster_index - 1); // 索引从1开始，调整为从0开始
+        }
+    }
+    return selected_clusters;
+}
+
+// 保存所选簇到文件
+void saveSelectedClusters(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud, std::vector<pcl::PointIndices> clusters, std::vector<int> selected_clusters, const std::string& filename)
+{
+    for (int index : selected_clusters)
+    {
+        for (const auto& pt_idx : clusters[index].indices)
+        {
+            selected_cloud->points.push_back(cloud->points[pt_idx]);
+        }
+    }
+    selected_cloud->width = selected_cloud->points.size();
+    selected_cloud->height = 1;
+}
+
+// 统计滤波器
+void applyStatisticalOutlierRemoval(pcl::PointCloud<pcl::PointXYZRGB>::Ptr input_cloud, pcl::PointCloud<pcl::PointXYZRGB>::Ptr output_cloud)
+{
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> sor_stat;
+    sor_stat.setInputCloud(input_cloud);
+    sor_stat.setMeanK(20);
+    sor_stat.setStddevMulThresh(0.01);
+    sor_stat.filter(*output_cloud);
+}
+
+// 法线估计
+void estimateNormals(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud, pcl::PointCloud<pcl::Normal>::Ptr normals, pcl::search::KdTree<pcl::PointXYZRGB>::Ptr tree, int KN_normal)
+{
+    pcl::NormalEstimation<pcl::PointXYZRGB, pcl::Normal> normal_estimator;
+    normal_estimator.setSearchMethod(tree);
+    normal_estimator.setInputCloud(cloud);
+    normal_estimator.setKSearch(KN_normal);
+    normal_estimator.compute(*normals);
+}
+
+// 区域生长分割
+void regionGrowingSegmentation(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud, pcl::PointCloud<pcl::Normal>::Ptr normals, std::vector<pcl::PointIndices>& clusters, int MinClusterSize, float DistanceThreshold, float ColorThreshold, float RegionColorThreshold, float SmoothnessThreshold, float CurvatureThreshold)
+{
+    pcl::search::KdTree<pcl::PointXYZRGB>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZRGB>);
+    pcl::RegionGrowingRGB<pcl::PointXYZRGB> reg;
+    reg.setInputCloud(cloud);
+    reg.setSearchMethod(tree);
+    reg.setDistanceThreshold(DistanceThreshold);
+    reg.setPointColorThreshold(ColorThreshold);
+    reg.setRegionColorThreshold(RegionColorThreshold);
+    reg.setMinClusterSize(MinClusterSize);
+    reg.setInputNormals(normals);
+    reg.setSmoothnessThreshold(SmoothnessThreshold / 180.0 * M_PI);
+    reg.setCurvatureThreshold(CurvatureThreshold);
+
+    reg.extract(clusters);
+}
+
+//////////////////////////////////人工精细分割阶段////////////////////////////////////////////////////////////////////////////
+
+void getScreentPos(double* displayPos, double* world, void* viewer_void)
+{
+    pcl::visualization::PCLVisualizer* viewer = static_cast<pcl::visualization::PCLVisualizer*> (viewer_void);
+    vtkRenderer* renderer{ viewer->getRendererCollection()->GetFirstRenderer() };
+    // First compute the equivalent of this display point on the focal plane
+    double fp[4], tmp1[4], eventFPpos[4];
+    renderer->GetActiveCamera()->GetFocalPoint(fp);
+    fp[3] = 0.0;
+    renderer->SetWorldPoint(fp);
+    renderer->WorldToDisplay();
+    renderer->GetDisplayPoint(tmp1);
+
+    tmp1[0] = displayPos[0];
+    tmp1[1] = displayPos[1];
+
+    renderer->SetDisplayPoint(tmp1);
+    renderer->DisplayToWorld();
+
+    renderer->GetWorldPoint(eventFPpos);
+    // Copy the result
+    for (int i = 0; i < 3; i++)
+    {
+        world[i] = eventFPpos[i];
+    }
+}
+
+int inOrNot1(int poly_sides, double* poly_X, double* poly_Y, double x, double y)
+{
+    int i, j;
+    j = poly_sides - 1;
+    int res = 0;
+
+    //对每一条边进行遍历，该边的两个端点，有一个必须在待检测点(x,y)的左边，且两个点中，有一个点的y左边比p.y小，另一个点的y比p.y大。
+    for (i = 0; i < poly_sides; i++) {
+        if (((poly_Y[i] < y && poly_Y[j] >= y) || (poly_Y[j] < y && poly_Y[i] >= y)) && (poly_X[i] <= x || poly_X[j] <= x))
+        {   //用水平的直线与该边相交，求交点的x坐标。
+            res ^= ((poly_X[i] + (y - poly_Y[i]) / (poly_Y[j] - poly_Y[i]) * (poly_X[j] - poly_X[i])) < x);
+        }
+        j = i;
+    }
+    return res;
+}
+
+
+void projectInliers(void* viewer_void)
+{
+    pcl::visualization::PCLVisualizer* viewer = static_cast<pcl::visualization::PCLVisualizer*> (viewer_void);
+
+    // 获取相机的焦点和位置
+    double focal[3] = { 0 }, pos[3] = { 0 };
+    vtkRenderer* renderer = viewer->getRendererCollection()->GetFirstRenderer();
+    renderer->GetActiveCamera()->GetFocalPoint(focal);
+    renderer->GetActiveCamera()->GetPosition(pos);
+
+    // 计算单位向量
+    pcl::PointXYZ eyeLine1 = pcl::PointXYZ(focal[0] - pos[0], focal[1] - pos[1], focal[2] - pos[2]);
+    float mochang = sqrt(pow(eyeLine1.x, 2) + pow(eyeLine1.y, 2) + pow(eyeLine1.z, 2));
+    pcl::PointXYZ eyeLine = pcl::PointXYZ(eyeLine1.x / mochang, eyeLine1.y / mochang, eyeLine1.z / mochang);
+
+    // 创建平面模型系数
+    pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients());
+    coefficients->values.resize(4);
+    coefficients->values[0] = eyeLine.x;
+    coefficients->values[1] = eyeLine.y;
+    coefficients->values[2] = eyeLine.z;
+    coefficients->values[3] = 0;
+
+    // 投影点云到平面
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloudIn_Prj(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloudCiecle_result(new pcl::PointCloud<pcl::PointXYZ>());
+
+    pcl::ProjectInliers<pcl::PointXYZ> proj;
+    proj.setModelType(pcl::SACMODEL_PLANE);
+    proj.setInputCloud(cloud_polygon);
+    proj.setModelCoefficients(coefficients);
+    proj.filter(*cloudCiecle_result);
+
+    // 将 cloud_in 从 PointCloudRGB 转换为 PointCloudXYZ 进行投影
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_in_xyz(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::copyPointCloud(*cloud_in, *cloud_in_xyz);
+
+    pcl::ProjectInliers<pcl::PointXYZ> projCloudIn;
+    projCloudIn.setModelType(pcl::SACMODEL_PLANE);
+    projCloudIn.setInputCloud(cloud_in_xyz);
+    projCloudIn.setModelCoefficients(coefficients);
+    projCloudIn.filter(*cloudIn_Prj);
+
+    int ret = -1;
+    double* PloyXarr = new double[cloudCiecle_result->points.size()];
+    double* PloyYarr = new double[cloudCiecle_result->points.size()];
+    for (int i = 0; i < cloudCiecle_result->points.size(); i++)
+    {
+        PloyXarr[i] = cloudCiecle_result->points[i].x;
+        PloyYarr[i] = cloudCiecle_result->points[i].y;
+    }
+
+    cloud_cliped->clear();
+    for (int i = 0; i < cloudIn_Prj->points.size(); i++)
+    {
+        ret = inOrNot1(cloud_polygon->points.size(), PloyXarr, PloyYarr, cloudIn_Prj->points[i].x, cloudIn_Prj->points[i].y);
+        if (0 == ret)//表示在外面
+        {
+            cloud_cliped->points.push_back(cloud_in->points[i]);
+        }//表示在里面
+    }
+
+    // 更新可视化
+    viewer->removeAllPointClouds();
+    viewer->addPointCloud(cloud_cliped, "aftercut");
+
+    cloud_in->clear();
+    pcl::copyPointCloud(*cloud_cliped, *cloud_in);
+
+    viewer->getRenderWindow()->Render();
+}
+
+void keyboardEventOccurred(const pcl::visualization::KeyboardEvent& event, void* viewer_void)
+{
+    pcl::visualization::PCLVisualizer* viewer = static_cast<pcl::visualization::PCLVisualizer*>(viewer_void);
+
+    if ((event.getKeySym() == "d" || event.getKeySym() == "D") && event.keyDown()) {
+        isPickingMode = !isPickingMode;
+        if (isPickingMode) {
+            std::cout << "start draw" << std::endl;
+            line_id = 0;
+            cloud_polygon->clear();
+            flag = false;
+        }
+        else {
+            std::cout << "stop draw" << std::endl;
+            projectInliers(viewer_void);
+            viewer->removeAllShapes();
+        }
+    }
+}
+
+void mouseEventOccurred(const pcl::visualization::MouseEvent& event, void* viewer_void)
+{
+    pcl::visualization::PCLVisualizer* viewer = static_cast<pcl::visualization::PCLVisualizer*> (viewer_void);
+    if (event.getButton() == pcl::visualization::MouseEvent::LeftButton &&
+        event.getType() == pcl::visualization::MouseEvent::MouseButtonRelease)
+    {
+        if (isPickingMode) {
+            double world_point[3];
+            double displayPos[2];
+            displayPos[0] = double(event.getX()), displayPos[1] = double(event.getY());
+            getScreentPos(displayPos, world_point, viewer_void);
+
+            curP = pcl::PointXYZ(world_point[0], world_point[1], world_point[2]);
+
+            if (!flag)flag = true;
+            else {
+                char str1[512];
+                sprintf(str1, "line#%03d", line_id++);//名字不能重复
+                viewer->addLine(lastP, curP, 1.0, 1.0, 0.0, str1); // 绘制线条
+            }
+            lastP = curP;
+            //切割点云添加
+            cloud_polygon->push_back(curP);
+        }
+    }
+}
+
+boost::shared_ptr<pcl::visualization::PCLVisualizer> interactionCustomizationVis()
+{
+    boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
+    viewer->setBackgroundColor(0, 0, 0);
+    viewer->setWindowName("Clipping point clouds");
+
+    viewer->addPointCloud(cloud_polygon, "polyline");
+    viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_COLOR, 1, 0, 0, "polyline");
+    viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 8, "polyline");
+
+    viewer->registerKeyboardCallback(keyboardEventOccurred, (void*)viewer.get());
+    viewer->registerMouseCallback(mouseEventOccurred, (void*)viewer.get());
+
+    return (viewer);
+}
+
+//////////////////////////////////mesh阶段////////////////////////////////////////////////////////////////////////////
+typedef pcl::PointXYZRGB PointT;
+typedef pcl::PointCloud<PointT> PointCloud;
+typedef pcl::PointCloud<PointT>::Ptr PointCloudPtr;
+
+typedef pcl::PointXYZRGBNormal SurfelT;
+typedef pcl::PointCloud<SurfelT> SurfelCloud;
+typedef pcl::PointCloud<SurfelT>::Ptr SurfelCloudPtr;
+
+// 将基本点云转化成光滑的带有法线信息的点云
+SurfelCloudPtr reconstructSurface(const PointCloudPtr& input, float radius, int polynomial_order) {
+    pcl::MovingLeastSquares<PointT, SurfelT> mls;
+    pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
+    mls.setSearchMethod(tree);
+    mls.setSearchRadius(radius);
+    mls.setComputeNormals(true);
+    mls.setPolynomialFit(polynomial_order > 1);
+    mls.setPolynomialOrder(polynomial_order);
+    mls.setInputCloud(input);
+
+    SurfelCloudPtr output(new SurfelCloud);
+    mls.process(*output);
+    return output;
+}
+
+// 为点云表面添加三角网格面元
+pcl::PolygonMeshPtr triangulateMesh(const SurfelCloudPtr& surfels) {
+    pcl::search::KdTree<SurfelT>::Ptr tree(new pcl::search::KdTree<SurfelT>);
+    tree->setInputCloud(surfels);
+
+    pcl::GreedyProjectionTriangulation<SurfelT> gp3;
+    pcl::PolygonMeshPtr triangles(new pcl::PolygonMesh);
+
+    gp3.setSearchRadius(0.05);                          // 设置搜索半径
+    gp3.setMu(20.0);                                     // 设置内侧点搜索距离
+    gp3.setMaximumNearestNeighbors(100);                // 设置最大邻居点数
+    gp3.setMaximumSurfaceAngle(M_PI / 4);               // 设置最大表面角（45度）
+    gp3.setMinimumAngle(M_PI / 18);                     // 设置最小角度（10度）
+    gp3.setMaximumAngle(2 * M_PI / 3);                  // 设置最大角度（120度）
+    gp3.setNormalConsistency(true);                     // 设置法线一致性
+
+    gp3.setInputCloud(surfels);
+    gp3.setSearchMethod(tree);
+    gp3.reconstruct(*triangles);
+
+    return triangles;
+}
+
+// 对网格应用拉普拉斯平滑
+pcl::PolygonMesh smoothMesh(const pcl::PolygonMesh::Ptr& mesh, int iterationsNumber) {
+    pcl::MeshSmoothingLaplacianVTK laplacianVtk;
+    laplacianVtk.setInputMesh(mesh);
+    laplacianVtk.setNumIter(iterationsNumber);
+    laplacianVtk.setConvergence(0.5f);
+    laplacianVtk.setRelaxationFactor(0.25f);
+    laplacianVtk.setFeatureAngle(360.f);
+    laplacianVtk.setEdgeAngle(180.f);
+
+    pcl::PolygonMesh smoothedMesh;
+    laplacianVtk.process(smoothedMesh);
+
+    return smoothedMesh;
+}
+
+
+int main(int argc, char** argv)
+{
+    // 参数设置
+    int MinClusterSize = 1000, KN_normal = 20;
+    float DistanceThreshold = 10.0, ColorThreshold =4.3, RegionColorThreshold =3.5, SmoothnessThreshold = 30.0, CurvatureThreshold = 0.05;
+
+    // 输入和输出文件路径
+    std::string input_file_path, output_file_path;
+    std::cout << "Enter the path to the input PLY file: ";
+    std::getline(std::cin, input_file_path);
+
+    // 定义点云对象
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_t(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    // 加载点云文件
+    pcl::io::loadPLYFile(input_file_path, *cloud_t);
+
+    // 记录开始时间
+    auto start_time1 = std::chrono::high_resolution_clock::now();
+
+    std::cout << "Original Cloud Size: " << cloud_t->points.size() << std::endl; // 输出原始点云个数
+
+    // 应用统计滤波器
+    applyStatisticalOutlierRemoval(cloud_t, cloud_filtered);
+    std::cout << "Statistical Outlier Removal Filtered Cloud Size: " << cloud_filtered->points.size() << std::endl;
+
+    std::cout << "Processing, please wait..." << std::endl;
+
+    // 法线估计
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+    pcl::search::KdTree<pcl::PointXYZRGB>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZRGB>);
+    estimateNormals(cloud_filtered, normals, tree, KN_normal);
+
+    // 区域生长分割
+    std::vector<pcl::PointIndices> clusters;
+    regionGrowingSegmentation(cloud_filtered, normals, clusters, MinClusterSize, DistanceThreshold, ColorThreshold, RegionColorThreshold, SmoothnessThreshold, CurvatureThreshold);
+
+    std::cout << "Number of clusters: " << clusters.size() << std::endl;
+
+    // 启动显示窗口线程
+    std::thread viewer_thread(showCloudWithClusters, cloud_filtered, clusters);
+
+    // 记录结束时间
+    auto end_time1 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed1 = end_time1 - start_time1;
+    std::cout << "Segmentation time: " << elapsed1.count() << " seconds." << std::endl;
+
+    // 获取用户选择的簇
+    std::vector<int> selected_clusters = getUserSelectedClusters(clusters.size());
+
+    std::cout << "Selected clusters: ";
+    for (int index : selected_clusters)
+    {
+        std::cout << index + 1 << " "; // 从1开始
+    }
+    std::cout << std::endl;
+
+    // 保存所选簇到文件
+    saveSelectedClusters(cloud_filtered, clusters, selected_clusters, output_file_path);
+    std::cout << "Please close the current visualization window" << endl;
+    // 等待显示窗口线程结束
+    viewer_thread.join();
+
+    boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer;
+    viewer = interactionCustomizationVis();
+    std::cout << "Manual cutting stage" << endl;
+    std::cout << "Press the d/D keyboard to start/end to select the deleted area" << endl;
+    std::cout << "If you close the current visualization window, you will go to the mesh stage." << endl;
+    {
+
+        cloud_in = selected_cloud;
+        viewer->addPointCloud(cloud_in, "cloud_in");
+    }
+
+    while (!viewer->wasStopped())
+    {
+        viewer->spinOnce(100);
+        boost::this_thread::sleep(boost::posix_time::microseconds(100000));
+    }
+
+    PointCloudPtr cloud(new PointCloud);
+    cloud = cloud_cliped;
+    // 输出点云大小
+    std::cout << "After cutting Cloud Size: " << cloud->points.size() << std::endl;
+
+    // 记录开始时间
+    auto start_time2 = std::chrono::high_resolution_clock::now();
+
+    // 计算表面元素
+    std::cout << "Computing surface ... " << std::endl;
+    double mls_radius = 0.05;
+    int polynomial_order = 2;
+    auto surfels = reconstructSurface(cloud, mls_radius, polynomial_order);
+
+    // 计算三角网格
+    std::cout << "Computing mesh ... " << std::endl;
+    pcl::PolygonMeshPtr mesh = triangulateMesh(surfels);
+
+    // 对网格进行拉普拉斯平滑处理
+    std::cout << "Applying Laplacian smoothing ... " << std::endl;
+    pcl::PolygonMesh smoothedMesh = smoothMesh(mesh, 3);  // 迭代5次
+
+    // 记录结束时间
+    auto end_time2 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed2 = end_time2 - start_time2;
+    std::cout << "Mesh time: " << elapsed2.count() << " seconds." << std::endl;
+
+    // 保存平滑后的网格
+    std::string output_filename = "output_mesh.ply";
+    if (pcl::io::savePLYFile(output_filename, smoothedMesh) == -1) {
+        PCL_ERROR("Couldn't write file \n");
+        return -1;
+    }
+    std::cout << "Saved smoothed mesh to " << output_filename << std::endl;
+
+    // 可视化网格
+    std::cout << "Displaying mesh ... " << std::endl;
+    pcl::visualization::PCLVisualizer viewer1("Mesh Viewer");
+    viewer1.addPolygonMesh(smoothedMesh, "smoothed_mesh");
+    viewer1.setBackgroundColor(0.0, 0.0, 0.0);
+    viewer1.resetCamera();
+    viewer1.spin();
+
+    return 0;
+}

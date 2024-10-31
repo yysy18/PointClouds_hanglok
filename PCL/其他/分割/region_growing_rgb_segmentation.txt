@@ -1,0 +1,94 @@
+#include <iostream>
+#include <vector>
+#include <pcl/point_types.h>
+#include <pcl/search/search.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/visualization/cloud_viewer.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/segmentation/region_growing_rgb.h>
+#include <pcl/console/print.h>
+#include <pcl/console/parse.h>
+#include <pcl/console/time.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/io/ply_io.h>
+#include <pcl/filters/voxel_grid.h>
+#include <chrono> // 用于时间测量
+
+int main(int argc, char** argv)
+{
+    bool Bool_Cuting = false, b_n = false;
+    int MinClusterSize = 600, KN_normal = 50;
+    float far_cuting = 10, near_cuting = 0, DistanceThreshold = 10.0, ColorThreshold = 6, RegionColorThreshold = 5, SmoothnessThreshold = 30.0, CurvatureThreshold = 0.05;
+
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_t(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    pcl::VoxelGrid<pcl::PointXYZRGB> sor;
+
+    pcl::io::loadPCDFile("../arm_desk.pcd", *cloud_t);
+
+    // 记录开始时间
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    sor.setInputCloud(cloud_t);
+    sor.setLeafSize(0.005f, 0.005f, 0.005f);
+    sor.filter(*cloud);
+    std::cout << cloud->points.size() << std::endl;
+
+    pcl::search::Search <pcl::PointXYZRGB>::Ptr tree = boost::shared_ptr<pcl::search::Search<pcl::PointXYZRGB> >(new pcl::search::KdTree<pcl::PointXYZRGB>);
+
+    pcl::search::Search<pcl::PointXYZRGB>::Ptr tree1 = boost::shared_ptr<pcl::search::Search<pcl::PointXYZRGB> >(new pcl::search::KdTree<pcl::PointXYZRGB>);
+    pcl::PointCloud <pcl::Normal>::Ptr normals(new pcl::PointCloud <pcl::Normal>);
+    pcl::NormalEstimation<pcl::PointXYZRGB, pcl::Normal> normal_estimator;
+    normal_estimator.setSearchMethod(tree);
+    normal_estimator.setInputCloud(cloud);
+    normal_estimator.setKSearch(KN_normal);
+    normal_estimator.compute(*normals);
+
+    pcl::IndicesPtr indices(new std::vector <int>);
+    if (Bool_Cuting)
+    {
+        pcl::PassThrough<pcl::PointXYZRGB> pass;
+        pass.setInputCloud(cloud);
+        pass.setFilterFieldName("z");
+        pass.setFilterLimits(near_cuting, far_cuting);
+        pass.filter(*indices);
+    }
+
+    pcl::RegionGrowingRGB<pcl::PointXYZRGB> reg;
+    reg.setInputCloud(cloud);
+    if (Bool_Cuting) reg.setIndices(indices);
+    reg.setSearchMethod(tree);
+    reg.setDistanceThreshold(DistanceThreshold);
+    reg.setPointColorThreshold(ColorThreshold);
+    reg.setRegionColorThreshold(RegionColorThreshold);
+    reg.setMinClusterSize(MinClusterSize);
+    if (b_n)
+    {
+        reg.setSmoothModeFlag(true);
+        reg.setCurvatureTestFlag(true);
+
+        reg.setInputNormals(normals);
+        reg.setSmoothnessThreshold(SmoothnessThreshold / 180.0 * M_PI);
+        reg.setCurvatureThreshold(CurvatureThreshold);
+    }
+    std::vector <pcl::PointIndices> clusters;
+    reg.extract(clusters);
+
+    std::cout << "number of cluster : " << clusters.size() << std::endl;
+
+    // 记录结束时间
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    std::cout << "Elapsed time: " << elapsed.count() << " seconds." << std::endl;
+
+    pcl::PointCloud <pcl::PointXYZRGB>::Ptr colored_cloud = reg.getColoredCloud();
+    pcl::visualization::CloudViewer viewer("基于颜色的区域生长算法实现点云分割");
+    viewer.showCloud(colored_cloud);
+    while (!viewer.wasStopped())
+    {
+        boost::this_thread::sleep(boost::posix_time::microseconds(100));
+    }
+    return 0;
+}

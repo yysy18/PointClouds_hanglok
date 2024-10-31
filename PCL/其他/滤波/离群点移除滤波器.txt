@@ -1,0 +1,49 @@
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <iostream>
+
+int main(int argc, char** argv) {
+    // 创建 PointCloud<pcl::PointXYZRGB> 智能指针
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    // 加载点云数据
+    if (pcl::io::loadPCDFile<pcl::PointXYZRGB>("../output.pcd", *cloud) == -1) {
+        PCL_ERROR("Couldn't read file \n");
+        return -1;
+    }
+
+    // 输出点云大小
+    std::cout << "Original Cloud Size: " << cloud->points.size() << std::endl;
+
+    // 创建统计离群点移除滤波器
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> sor;
+    sor.setInputCloud(cloud);
+    sor.setMeanK(50); // 设置邻域点数
+    sor.setStddevMulThresh(0.01); // 设置标准差阈值
+    sor.filter(*cloud_filtered);
+
+    // 输出滤波后点云大小
+    std::cout << "Filtered Cloud Size: " << cloud_filtered->points.size() << std::endl;
+
+    // 保存滤波后的点云数据到文件
+    pcl::io::savePCDFileASCII("../filtered_output.pcd", *cloud_filtered);
+    std::cout << "Filtered point cloud saved to filtered_output.pcd" << std::endl;
+
+    // 创建可视化窗口
+    pcl::visualization::PCLVisualizer viewer("Cloud Viewer");
+    viewer.setBackgroundColor(0.0, 0.0, 0.0);
+
+    // 添加点云到可视化窗口
+    viewer.addPointCloud<pcl::PointXYZRGB>(cloud_filtered, "filtered cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "filtered cloud");
+    viewer.resetCamera();
+
+    // 开始可视化
+    viewer.spin();
+
+    return 0;
+}
